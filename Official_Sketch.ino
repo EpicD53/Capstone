@@ -6,14 +6,14 @@
 // MQTT Broker Settings
 const char *mqtt_broker = "192.168.4.2"; // Remove the trailing space!
 
-const char *topic_1 = "pressure_topic";
-const char *topic_2 = "flow_topic";
-const char *topic_3 = "pump_topic";
+const char *topic_1 = "esp32/pressure";
+const char *topic_2 = "esp32/flow";
+const char *topic_3 = "esp32/pump";
 const char *topic_4 = "top_valve";
 const char *topic_5 = "bottom_valve";
-const char *topic_6 = "ready_topic";
-const char *topic_7 = "blockage_leakage_topic";
-const char *topic_8 = "override_topic";
+const char *topic_6 = "system_ready";
+const char *topic_7 = "system_status";
+const char *topic_8 = "override_status";
 
 const char *mqtt_username = "master";
 const char *mqtt_password = "masterpass";
@@ -182,7 +182,7 @@ void SetupMQTT() {
     client.setCallback(callback);
 }
 void ConnectMQTT() {
-    while (!client.connected() && (!isReadyEnableOn()) ) {
+    while (!client.connected() && (!isBottomEnableOn()) ) {
         String client_id = "esp32-client-" + String(WiFi.macAddress());
         Serial.printf("Connecting to MQTT as %s...\n", client_id.c_str());
         displayStatus("Connecting", "to Client");
@@ -201,7 +201,7 @@ void ConnectMQTT() {
             for (int i = 0; i < 5000; i++) {
                 delay(1);
 
-                if (isReadyEnableOn()) {
+                if (isBottomEnableOn()) {
                     return;   // skip connecting, leave function immediately
                 }
             }
@@ -369,8 +369,8 @@ ledcWrite(tank_strip, 0);   // start off
 
     //State 3
 
-        while (isReadyEnableOn()) {
-            displayStatus("Flip Switch 4", "");
+        while (isBottomEnableOn()) {
+            displayStatus("Flip Switch 3", "");
             // waiting...
         }
 
@@ -428,17 +428,21 @@ void loop() {
 
     Serial.print("Pressure: ");
     Serial.println(current_pressure);
+
+
+      char Pressuremsg[10];
+      char Flowmsg[10];
+      dtostrf(current_pressure, 4, 2, Pressuremsg);  // (value, width, decimal places, buffer)
+      dtostrf(current_flow, 4, 2, Flowmsg);  // (value, width, decimal places, buffer)
+
+      displayPressureAndFlow(current_pressure,current_flow, current_pressure_threshold, current_flow_threshold);
+
+      client.publish(topic_1, Pressuremsg);
+      client.publish(topic_2, Flowmsg); 
+
   }
 
-  char Pressuremsg[10];
-  char Flowmsg[10];
-  dtostrf(current_pressure, 4, 2, Pressuremsg);  // (value, width, decimal places, buffer)
-  dtostrf(current_flow, 4, 2, Flowmsg);  // (value, width, decimal places, buffer)
 
-  displayPressureAndFlow(current_pressure,current_flow, current_pressure_threshold, current_flow_threshold);
-
-  client.publish(topic_1, Pressuremsg);
-  client.publish(topic_2, Flowmsg); 
 
 
 if (current_pressure <= (current_pressure_threshold - leak_buffer)) {                             //Leak Detected
@@ -535,10 +539,10 @@ else if (current_pressure >= (current_pressure_threshold + block_buffer)) {     
   // }
 
 
-  //if (!client.connected()) {
-  //    ConnectMQTT();
-  //}
-  //client.loop();
+  if (!client.connected()) {
+     ConnectMQTT();
+  }
+  client.loop();
 }
 
 
