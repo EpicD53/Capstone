@@ -2,10 +2,20 @@
 #include <PubSubClient.h>
 #include <Wire.h>
 #include <U8g2lib.h>
+#include <time.h>
+#include <sys/time.h>
+
+//Time
+uint64_t latencyTimestampMs = 0;
+bool timestampPublished = false;
 
 // WiFi Settings
 const char *ssid = "Plymouth";         // Same network as MQTT broker
 const char *password = "rwee2763";
+
+
+char Pressuremsg[10];
+char Flowmsg[10];
 
 void ConnectWiFi() {
     WiFi.mode(WIFI_STA);
@@ -26,11 +36,15 @@ const char *mqtt_broker = "10.229.170.200"; // Remove the trailing space!
 const char *topic_1 = "esp32/pressure";
 const char *topic_2 = "esp32/flow";
 const char *topic_3 = "esp32/pump";
-const char *topic_4 = "top_valve";
-const char *topic_5 = "bottom_valve";
+const char *topic_4 = "esp32/top_valve";
+const char *topic_5 = "esp32/bottom_valve";
 const char *topic_6 = "system_ready";
 const char *topic_7 = "system_status";
-const char *topic_8 = "override_status";
+const char *topic_8 = "system_pause";
+const char *topic_9 = "block_threshold"; //displays a horizontal line on the dashboard
+const char *topic_10 = "leak_threshold"; //displays a horizontal line on the dashboard
+const char *topic_11 = "esp32/latency_test"; //displays a horizontal line on the dashboard
+
 
 const char *mqtt_username = "master";
 const char *mqtt_password = "masterpass";
@@ -52,10 +66,56 @@ const int top_valve = 33;
 const int bottom_valve = 25;
 const int tank_strip = 26;
 
+bool SyncTimeFromNTP() {
+    // UTC
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+    struct timeval tv;
+    Serial.print("Syncing time from NTP");
+
+    for (int i = 0; i < 30; i++) {
+        gettimeofday(&tv, NULL);
+
+        // If time is valid, tv_sec will be a large Unix timestamp
+        if (tv.tv_sec > 1700000000) {
+            Serial.println("\nTime synced!");
+            return true;
+        }
+
+        Serial.print(".");
+        delay(500);
+    }
+
+    Serial.println("\nFailed to sync time");
+    return false;
+}
+
+uint64_t GetEpochMs() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return ((uint64_t)tv.tv_sec * 1000ULL) + ((uint64_t)tv.tv_usec / 1000ULL);
+}
+
+void PublishLatencyTimestampOnce() {
+    if (timestampPublished) return;
+
+    latencyTimestampMs = GetEpochMs();
+
+    char TimeStamp[32];
+    snprintf(TimeStamp, sizeof(TimeStamp), "%llu",
+             (unsigned long long)latencyTimestampMs);
+
+    client.publish(topic_11, TimeStamp);
+    Serial.print("Published latency timestamp: ");
+    Serial.println(TimeStamp);
+
+    timestampPublished = true;
+}
+
 
 void OpenTopValve() {
   digitalWrite(top_valve, HIGH);
-  client.publish(topic_4, "OPEN");
+  //client.publish(topic_4, "OPEN");
 }
 
 void OpenBottomValve() {
@@ -73,7 +133,7 @@ void TurnOffPump() {
 
 void CloseTopValve() {
   digitalWrite(top_valve, LOW);
-  client.publish(topic_4, "CLOSE");
+  //client.publish(topic_4, "CLOSE");
 }
 
 void CloseBottomValve() {
@@ -83,6 +143,14 @@ void CloseBottomValve() {
 
 void TurnOffTankStrip() {
   ledcWrite(tank_strip, 0);   // full brightness
+}
+
+void TurnOnPump() {
+    if (digitalRead(top_valve) == LOW && digitalRead(bottom_valve) == LOW) {
+        displayStatus("Cannot turn", "on Pump");                                   //Protection for Pump
+    } else {
+        digitalWrite(pump, HIGH);
+    }
 }
 
 
@@ -175,16 +243,63 @@ void displayPressureAndFlow(float psi, float flow, float Pthreshold, float Fthre
 }
 
 
-// Callback function
+int flag = 0;
+
 void callback(char *topic, byte *payload, unsigned int length) {
     Serial.print("Message arrived in topic: ");
     Serial.println(topic);
+
+    String message = "";
+
     Serial.print("Message: ");
-    for (int i = 0; i < length; i++) {
-        Serial.print((char) payload[i]);
+    for (unsigned int i = 0; i < length; i++) {
+        char c = (char)payload[i];
+        Serial.print(c);
+        message += c;
     }
-    Serial.println("\n-----------------------");
+
+    Serial.println();
+    Serial.println("-----------------------");
+
+if (String(topic) == topic_3) {   // "esp32/pump"
+    if (message == "ON") {
+        TurnOnPump();
+        flag = 0;
+        unsigned long start = millis();
+    while (millis() - start < 2000) {
+        client.loop();
+    }
+    }
+    else if (message == "OFF") {
+        TurnOffPump();
+        flag = 1;
+    }
 }
+else if (String(topic) == topic_4) {   // "top_valve"
+    if (message == "OPEN") {
+        OpenTopValve();
+        flag = 1;
+    }
+    else if (message == "SHUT") {
+        CloseTopValve();
+        flag = 0;
+        unsigned long start = millis();
+    while (millis() - start < 6000) {
+        client.loop();
+    }
+    }
+}
+else if (String(topic) == topic_8) {   // "user_pause"
+    if (message == "RESUME") {
+        flag = 0;
+    }
+    else if (message == "PAUSE") {
+        flag = 1;
+    }
+    }
+}
+
+
 void SetupMQTT() {
     Serial.println("\n=== Starting ESP32 as Access Point ===");
 
@@ -206,10 +321,11 @@ void ConnectMQTT() {
         
         if (client.connect(client_id.c_str(), mqtt_username, mqtt_password)) {
             Serial.println("MQTT Connected!");
-            client.publish(topic_6, "YES");
             client.subscribe(topic_3);
             client.subscribe(topic_4);
-            client.subscribe(topic_5);                        
+            client.subscribe(topic_5);      
+            client.subscribe(topic_6);      
+            client.subscribe(topic_8);                    
         } else {
             Serial.print("Failed, rc=");
             Serial.print(client.state());
@@ -250,7 +366,13 @@ void updateFlow() {
   }
 }
 
+float leak_buffer = 0.25;
+float block_buffer = 2.0;
+float critical_buffer = 3.5; 
+
 void CalculateThresholds(int valuesPerSecond, int Seconds) {
+
+    client.publish(topic_7, "WAITING");
 
     lastFlowUpdate = millis();
     noInterrupts();
@@ -271,6 +393,16 @@ void CalculateThresholds(int valuesPerSecond, int Seconds) {
 
     displayStatus("Calculating", "Thresholds");
     int animation_counter = 0;
+
+
+    char PressuremsgHIGH[10];
+    char PressuremsgLOW[10];
+
+    float pressure_blockage = current_pressure_threshold + block_buffer;
+    float pressure_leakage = current_pressure_threshold - leak_buffer;
+
+    dtostrf(pressure_blockage, 4, 2, PressuremsgHIGH);  // (value, width, decimal places, buffer)
+    dtostrf(pressure_leakage, 4, 2, PressuremsgLOW);  // (value, width, decimal places, buffer)
 
     for (int i = 0; i < totalCalculations; i++) {
 
@@ -307,9 +439,20 @@ void CalculateThresholds(int valuesPerSecond, int Seconds) {
             currentFlowReading = getFlow();
             FlowSum += currentFlowReading;
             flowSamples++;
+
+            dtostrf(currentPressureReading, 4, 2, Pressuremsg);  // (value, width, decimal places, buffer)
+            dtostrf(currentFlowReading, 4, 2, Flowmsg);  // (value, width, decimal places, buffer)
+            
+            client.publish(topic_1, Pressuremsg);
+            client.publish(topic_2, Flowmsg); 
         }
 
-        delay(delayPerSample);
+        unsigned long start = millis();
+    while (millis() - start < delayPerSample) {
+        client.loop();
+    }
+
+
     }
 
     // --- Final averages ---
@@ -320,6 +463,20 @@ void CalculateThresholds(int valuesPerSecond, int Seconds) {
     } else {
         current_flow_threshold = 0; // safety fallback
     }
+
+
+
+      pressure_blockage = current_pressure_threshold + block_buffer;
+      pressure_leakage = current_pressure_threshold - leak_buffer;
+
+      dtostrf(pressure_blockage, 4, 2, PressuremsgHIGH);  // (value, width, decimal places, buffer)
+      dtostrf(pressure_leakage, 4, 2, PressuremsgLOW);  // (value, width, decimal places, buffer)
+      
+      client.publish(topic_9, PressuremsgHIGH); 
+      client.publish(topic_10, PressuremsgLOW); 
+
+      client.publish(topic_7, "IDLE");
+
 }
 
 
@@ -327,13 +484,7 @@ void CalculateThresholds(int valuesPerSecond, int Seconds) {
 
 
 
-void TurnOnPump() {
-    if (digitalRead(top_valve) == LOW && digitalRead(bottom_valve) == LOW) {
-        displayStatus("Cannot turn", "on Pump");                                   //Protection for Pump
-    } else {
-        digitalWrite(pump, HIGH);
-    }
-}
+
 
 const int pwmFreq = 5000;
 const int pwmResolution = 8;   // duty 0-255
@@ -382,9 +533,15 @@ ledcWrite(tank_strip, 0);   // start off
 
     ConnectWiFi();
 
+    SyncTimeFromNTP();
+
     SetupMQTT();
 
     ConnectMQTT();
+
+    client.publish(topic_6, "NO"); //Ready
+    PublishLatencyTimestampOnce();
+ 
 
     //State 3
 
@@ -400,7 +557,10 @@ ledcWrite(tank_strip, 0);   // start off
               char buffer[32];
               sprintf(buffer, "Opening: %d", i);
               displayStatus(buffer, "");
-              delay(1000);
+              unsigned long start = millis();
+    while (millis() - start < 1000) {
+        client.loop();
+    }
           }
         
 
@@ -408,11 +568,19 @@ ledcWrite(tank_strip, 0);   // start off
 
         TurnOnPump();
         displayStatus("Turning", "on pump");
-        delay(3000); //let water settle in pipes
+        unsigned long start = millis();
+    while (millis() - start < 3000) {
+        client.loop();
+    } //let water settle in pipes
 
         CalculateThresholds(10,10);
-        client.publish(topic_6, "YES"); //Ready
-        client.publish(topic_7, "IDLE");
+        if (!client.connected()) {
+    ConnectMQTT();
+}
+client.loop();
+
+client.publish(topic_6, "YES"); //Ready
+client.publish(topic_7, "IDLE");
 
 
 }
@@ -429,14 +597,8 @@ void loop() {
 
   updateFlow();
 
-  float leak_buffer = 0.3;
-  float block_buffer = 2.0;
-  float critical_buffer = 3.5; 
-
-
 
   unsigned long now = millis();
-
 
 
   // --- read pressure every 500 ms ---
@@ -450,8 +612,7 @@ void loop() {
     Serial.println(current_pressure);
 
 
-      char Pressuremsg[10];
-      char Flowmsg[10];
+
       dtostrf(current_pressure, 4, 2, Pressuremsg);  // (value, width, decimal places, buffer)
       dtostrf(current_flow, 4, 2, Flowmsg);  // (value, width, decimal places, buffer)
 
@@ -465,7 +626,7 @@ void loop() {
 
 
 
-if (current_pressure <= (current_pressure_threshold - leak_buffer)) {                             //Leak Detected
+if ((current_pressure <= (current_pressure_threshold - leak_buffer)) && flag == 0) {                             //Leak Detected
     client.publish(topic_6, "NO");
     client.publish(topic_7, "LEAK");
     displayStatus("Leak Detected", "");
@@ -473,18 +634,44 @@ if (current_pressure <= (current_pressure_threshold - leak_buffer)) {           
     for (int i = 0; i < 2; i++) {
       fadeTankStripOnce();
     }
+      unsigned long lastPublish = 0;
+      const unsigned long publishInterval = 500; // 0.5 sec
 
-    while (!isReadyEnableOn()) {
-        displayStatus("Toggle Switch #4", "to reset");
-    }
+        while (!isReadyEnableOn()) {
+            client.loop();  // VERY IMPORTANT (so MQTT still works)
+
+            updateFlow();
+            displayStatus("Toggle Switch #4", "reset");
+
+            unsigned long now = millis();
+
+            current_pressure = getPressure();
+            current_flow = getFlow();
+
+            dtostrf(current_pressure, 4, 2, Pressuremsg);  // (value, width, decimal places, buffer)
+            dtostrf(current_flow, 4, 2, Flowmsg);  // (value, width, decimal places, buffer)
+
+            if (now - lastPublish >= publishInterval) {
+                lastPublish = now;
+
+                client.publish(topic_1, Pressuremsg);
+                client.publish(topic_2, Flowmsg); 
+            }
+        }
     while (isReadyEnableOn()) {
         displayStatus("Toggle Switch #4", "to reset");
+    }
+    if (digitalRead(top_valve) == HIGH ) {
+      displayStatus("Resetting", "Valves");
+      CloseTopValve();
+      delay(6000);      
     }
     TurnOnPump();
     TurnOnTankStrip();
     displayStatus("Turning", "on Pump");
     delay(3000);
     CalculateThresholds(10, 10);
+    flag = 0;
     client.publish(topic_6, "YES");
     client.publish(topic_7, "IDLE");
 
@@ -495,16 +682,31 @@ else if (current_pressure >= (current_pressure_threshold + critical_buffer)) {  
       for (int i = 0; i < 2; i++) {
         fadeTankStripOnce();
       }
-      TurnOffPump();    
+      TurnOffPump(); 
 
-      while (!isReadyEnableOn()) {
-        displayStatus("Toggle Switch #4", "reset");
-      }
+      unsigned long lastPublish = 0;
+      const unsigned long publishInterval = 500; // 0.5 sec
+
+        while (!isReadyEnableOn()) {
+            client.loop();  // VERY IMPORTANT (so MQTT still works)
+
+            displayStatus("Toggle Switch #4", "reset");
+
+            unsigned long now = millis();
+
+            if (now - lastPublish >= publishInterval) {
+                lastPublish = now;
+
+                client.publish(topic_1, Pressuremsg);
+                client.publish(topic_2, Flowmsg); 
+            }
+        }
       while (isReadyEnableOn()) {
         displayStatus("Toggle Switch #4", "to reset");
       }
       CalculateThresholds(10,10);
       client.publish(topic_6, "YES");
+      flag = 0;
 }
 else if (current_pressure >= (current_pressure_threshold + block_buffer)) {                             //Blockage Detected
       client.publish(topic_6, "NO");
@@ -520,9 +722,30 @@ else if (current_pressure >= (current_pressure_threshold + block_buffer)) {     
       TurnOnTankStrip();
       CloseBottomValve();   
 
-      while (!isReadyEnableOn()) {
-        displayStatus("Toggle Switch #4", "to reset");
-      }
+      unsigned long lastPublish = 0;
+      const unsigned long publishInterval = 500; // 0.5 sec
+
+        while (!isReadyEnableOn()) {
+            client.loop();  // VERY IMPORTANT (so MQTT still works)
+
+            updateFlow();
+            displayStatus("Toggle Switch #4", "reset");
+
+            unsigned long now = millis();
+
+            current_pressure = getPressure();
+            current_flow = getFlow();
+
+            dtostrf(current_pressure, 4, 2, Pressuremsg);  // (value, width, decimal places, buffer)
+            dtostrf(current_flow, 4, 2, Flowmsg);  // (value, width, decimal places, buffer)
+
+            if (now - lastPublish >= publishInterval) {
+                lastPublish = now;
+
+                client.publish(topic_1, Pressuremsg);
+                client.publish(topic_2, Flowmsg); 
+            }
+        }
       while (isReadyEnableOn()) {
         displayStatus("Toggle Switch #4", "to reset");
         TurnOffPump();
@@ -539,6 +762,7 @@ else if (current_pressure >= (current_pressure_threshold + block_buffer)) {     
       CalculateThresholds(10,10);
       client.publish(topic_6, "YES");   
       client.publish(topic_7, "IDLE");
+      flag = 0;
 }
 
 
