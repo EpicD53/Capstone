@@ -13,6 +13,8 @@ bool timestampPublished = false;
 const char *ssid = "Plymouth";         // Same network as MQTT broker
 const char *password = "rwee2763";
 
+float pressure_sd = 0;
+float flow_sd = 0;
 
 char Pressuremsg[10];
 char Flowmsg[10];
@@ -31,7 +33,7 @@ void ConnectWiFi() {
 }
 
 // MQTT Broker Settings
-const char *mqtt_broker = "10.229.170.200"; // Remove the trailing space!
+const char *mqtt_broker = "10.229.170.200";
 
 const char *topic_1 = "esp32/pressure";
 const char *topic_2 = "esp32/flow";
@@ -98,6 +100,9 @@ uint64_t GetEpochMs() {
 
 void PublishLatencyTimestampOnce() {
     if (timestampPublished) return;
+
+    if (!client.connected()) return;
+
 
     latencyTimestampMs = GetEpochMs();
 
@@ -261,41 +266,51 @@ void callback(char *topic, byte *payload, unsigned int length) {
     Serial.println();
     Serial.println("-----------------------");
 
-if (String(topic) == topic_3) {   // "esp32/pump"
-    if (message == "ON") {
-        TurnOnPump();
-        flag = 0;
-        unsigned long start = millis();
-    while (millis() - start < 2000) {
-        client.loop();
+    if (String(topic) == topic_3) {   // "esp32/pump"
+        if (message == "ON") {
+            if (digitalRead(top_valve) == HIGH) {
+                TurnOnPump();
+                flag = 1;
+                unsigned long start = millis();
+                while (millis() - start < 2000) {
+                    client.loop();
+                }
+            } 
+            else if (digitalRead(top_valve) == LOW) {
+                TurnOnPump();
+                flag = 0;
+                unsigned long start = millis();
+                while (millis() - start < 2000) {
+                    client.loop();
+                }
+            }
+        } 
+        else if (message == "OFF") {
+            TurnOffPump();
+            flag = 1;
+        }
     }
+    else if (String(topic) == topic_4) {   // "top_valve"
+        if (message == "OPEN") {
+            OpenTopValve();
+            flag = 1;
+        }
+        else if (message == "SHUT") {
+            CloseTopValve();
+            flag = 0;
+            unsigned long start = millis();
+            while (millis() - start < 6000) {
+                client.loop();
+            }
+        }
     }
-    else if (message == "OFF") {
-        TurnOffPump();
-        flag = 1;
-    }
-}
-else if (String(topic) == topic_4) {   // "top_valve"
-    if (message == "OPEN") {
-        OpenTopValve();
-        flag = 1;
-    }
-    else if (message == "SHUT") {
-        CloseTopValve();
-        flag = 0;
-        unsigned long start = millis();
-    while (millis() - start < 6000) {
-        client.loop();
-    }
-    }
-}
-else if (String(topic) == topic_8) {   // "user_pause"
-    if (message == "RESUME") {
-        flag = 0;
-    }
-    else if (message == "PAUSE") {
-        flag = 1;
-    }
+    else if (String(topic) == topic_8) {   // "user_pause"
+        if (message == "RESUME") {
+            flag = 0;
+        }
+        else if (message == "PAUSE") {
+            flag = 1;
+        }
     }
 }
 
@@ -307,7 +322,7 @@ void SetupMQTT() {
     WiFi.softAP("ESP32_Broker", "12345678");
     Serial.println("Access Point Started");
     Serial.print("AP IP Address: ");
-    Serial.println(WiFi.softAPIP()); // Should be 192.168.4.1
+    Serial.println(WiFi.softAPIP());
     
     // 2. Setup MQTT (connecting to broker on THIS device)
     client.setServer(mqtt_broker, mqtt_port);
@@ -388,27 +403,30 @@ void CalculateThresholds(int valuesPerSecond, int Seconds) {
     int totalCalculations = valuesPerSecond * Seconds;
     int delayPerSample = 1000 / valuesPerSecond;
 
-    int flowSamples = 0;              // count how many flow samples we take
+    int flowSamples = 0;
     unsigned long lastFlowSample = millis();
+
+    // Limit sample count
+    const int MAX_SAMPLES = 200;
+    if (totalCalculations > MAX_SAMPLES) {
+        totalCalculations = MAX_SAMPLES;
+    }
+
+    // Arrays to store samples
+    float pressure_data[MAX_SAMPLES];
+    float flow_data[MAX_SAMPLES];
 
     displayStatus("Calculating", "Thresholds");
     int animation_counter = 0;
 
-
     char PressuremsgHIGH[10];
     char PressuremsgLOW[10];
-
-    float pressure_blockage = current_pressure_threshold + block_buffer;
-    float pressure_leakage = current_pressure_threshold - leak_buffer;
-
-    dtostrf(pressure_blockage, 4, 2, PressuremsgHIGH);  // (value, width, decimal places, buffer)
-    dtostrf(pressure_leakage, 4, 2, PressuremsgLOW);  // (value, width, decimal places, buffer)
+    char Pressuremsg[10];
+    char Flowmsg[10];
 
     for (int i = 0; i < totalCalculations; i++) {
 
-        // --- Always update flow in background ---
         updateFlow();
-
 
         const char* animation = "";
         if (animation_counter == 0) {
@@ -420,39 +438,43 @@ void CalculateThresholds(int valuesPerSecond, int Seconds) {
         } else if (animation_counter == 3) {
             animation = "...";
             animation_counter = 0;
-          }
+        }
 
         animation_counter++;
         char buffer[30];
         snprintf(buffer, sizeof(buffer), "Thresholds %s", animation);
+        displayStatus("Calculating", buffer);
 
-        displayStatus("Calculating", buffer);   
-        // --- Pressure sampling (fast) ---
+        // Pressure sample every loop
         currentPressureReading = getPressure();
         PressureSum += currentPressureReading;
+        pressure_data[i] = currentPressureReading;
 
-        // --- Flow sampling (ONLY every 1000 ms) ---
+        // Flow sample once per second
         unsigned long now = millis();
         if (now - lastFlowSample >= 1000) {
             lastFlowSample = now;
 
             currentFlowReading = getFlow();
             FlowSum += currentFlowReading;
+
+            if (flowSamples < MAX_SAMPLES) {
+                flow_data[flowSamples] = currentFlowReading;
+            }
+
             flowSamples++;
 
-            dtostrf(currentPressureReading, 4, 2, Pressuremsg);  // (value, width, decimal places, buffer)
-            dtostrf(currentFlowReading, 4, 2, Flowmsg);  // (value, width, decimal places, buffer)
-            
+            dtostrf(currentPressureReading, 4, 2, Pressuremsg);
+            dtostrf(currentFlowReading, 4, 2, Flowmsg);
+
             client.publish(topic_1, Pressuremsg);
-            client.publish(topic_2, Flowmsg); 
+            client.publish(topic_2, Flowmsg);
         }
 
         unsigned long start = millis();
-    while (millis() - start < delayPerSample) {
-        client.loop();
-    }
-
-
+        while (millis() - start < delayPerSample) {
+            client.loop();
+        }
     }
 
     // --- Final averages ---
@@ -461,22 +483,53 @@ void CalculateThresholds(int valuesPerSecond, int Seconds) {
     if (flowSamples > 0) {
         current_flow_threshold = FlowSum / flowSamples;
     } else {
-        current_flow_threshold = 0; // safety fallback
+        current_flow_threshold = 0;
     }
 
+    // --- Standard deviation ---
+    float pressure_sd_sum = 0;
+    float flow_sd_sum = 0;
 
+    for (int i = 0; i < totalCalculations; i++) {
+        float diff = pressure_data[i] - current_pressure_threshold;
+        pressure_sd_sum += diff * diff;
+    }
 
-      pressure_blockage = current_pressure_threshold + block_buffer;
-      pressure_leakage = current_pressure_threshold - leak_buffer;
+    for (int i = 0; i < flowSamples; i++) {
+        float diff = flow_data[i] - current_flow_threshold;
+        flow_sd_sum += diff * diff;
+    }
 
-      dtostrf(pressure_blockage, 4, 2, PressuremsgHIGH);  // (value, width, decimal places, buffer)
-      dtostrf(pressure_leakage, 4, 2, PressuremsgLOW);  // (value, width, decimal places, buffer)
-      
-      client.publish(topic_9, PressuremsgHIGH); 
-      client.publish(topic_10, PressuremsgLOW); 
+    pressure_sd = sqrt(pressure_sd_sum / totalCalculations);
 
-      client.publish(topic_7, "IDLE");
+    if (flowSamples > 0) {
+        flow_sd = sqrt(flow_sd_sum / flowSamples);
+    } else {
+        flow_sd = 0;
+    }
 
+    float pressure_blockage = current_pressure_threshold + 2;
+    float pressure_leakage  = current_pressure_threshold - 0.25;
+
+    dtostrf(pressure_blockage, 4, 2, PressuremsgHIGH);
+    dtostrf(pressure_leakage, 4, 2, PressuremsgLOW);
+
+    client.publish(topic_9, PressuremsgHIGH);
+    client.publish(topic_10, PressuremsgLOW);
+
+    client.publish(topic_7, "IDLE");
+
+    Serial.print("Pressure mean: ");
+    Serial.println(current_pressure_threshold);
+    Serial.print("Pressure SD: ");
+    Serial.println(pressure_sd);
+
+    Serial.print("Flow mean: ");
+    Serial.println(current_flow_threshold);
+    Serial.print("Flow SD: ");
+    Serial.println(flow_sd);
+
+    PublishLatencyTimestampOnce();
 }
 
 
@@ -540,7 +593,7 @@ ledcWrite(tank_strip, 0);   // start off
     ConnectMQTT();
 
     client.publish(topic_6, "NO"); //Ready
-    PublishLatencyTimestampOnce();
+
  
 
     //State 3
@@ -592,6 +645,8 @@ const unsigned long interval = 1000;
 
 float current_pressure = 0;
 float current_flow = 0;
+
+
 
 void loop() {
 
